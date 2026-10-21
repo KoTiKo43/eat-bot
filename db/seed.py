@@ -94,7 +94,7 @@ def _validate(data: list[dict], category_names: set[str], diet_names: set[str]) 
                 continue
             try:
                 value = Decimal(str(raw))
-            except InvalidOperation, ValueError:
+            except (InvalidOperation, ValueError):
                 errors.append(f"{prefix}: {key}={raw!r} - не число")
                 continue
             if key in POSITIVE_ONLY and value <= 0:
@@ -138,7 +138,7 @@ def _validate(data: list[dict], category_names: set[str], diet_names: set[str]) 
             if quantity is not None:
                 try:
                     Decimal(str(quantity))
-                except InvalidOperation, ValueError:
+                except (InvalidOperation, ValueError):
                     errors.append(
                         f"{prefix}: ингредиент #{num} «{name.strip()}»: "
                         f"quantity={quantity!r} - не число"
