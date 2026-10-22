@@ -1,19 +1,23 @@
-from aiogram import Router, F
+from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
 router = Router()
+
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Каталог")],
-            [KeyboardButton(text="Поиск"), KeyboardButton(text="Предложить рецепт")]
+            [KeyboardButton(text="Поиск"), KeyboardButton(text="Предложить рецепт")],
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
     )
-    await message.answer("Привет! Я бот с рецептами Eat! 👨‍🍳\nВыбирай действие в меню ниже:", reply_markup=kb)
+    await message.answer(
+        "Привет! Я бот с рецептами Eat! 👨‍🍳\nВыбирай действие в меню ниже:", reply_markup=kb
+    )
+
 
 @router.message(F.text == "Каталог")
 async def show_catalog(message: Message):
