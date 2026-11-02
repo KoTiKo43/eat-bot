@@ -34,6 +34,7 @@ def _sqlite_pragma(dbapi_conn, _connection_record) -> None:
     cursor.close()
     dbapi_conn.create_function("lower", 1, _unicode_lower)
 
+
 def _unicode_lower(value):
     if value is None:
         return None
