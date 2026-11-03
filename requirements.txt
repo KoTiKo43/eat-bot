@@ -4,3 +4,4 @@ aiosqlite>=0.20
 alembic>=1.13
 pydantic-settings>=2.5
 python-dotenv>=1.0
+aiohttp-socks
