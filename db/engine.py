@@ -4,6 +4,12 @@ SQLite не проверяет внешние ключи, пока на кажд
 PRAGMA foreign_keys=ON. Без неё CASCADE/SET NULL/RESTRICT из схемы
 молча не работают. На PostgreSQL огород не нужен - там FK всегда включены,
 поэтому прагма вешается только для диалекта sqlite.
+
+Встроенный lower() в SQLite опускает регистр только
+у ASCII - кириллица остаётся как есть, и поиск "овсян" не находил "Овсянка"
+(repo.search_by_title). Поверх встроенной регистрируется Python-функция
+lower() с полной Unicode-поддержкой. На PostgreSQL родной lower() уже
+Unicode - переопределение не нужно.
 """
 
 from sqlalchemy import event
@@ -26,6 +32,13 @@ def _sqlite_pragma(dbapi_conn, _connection_record) -> None:
     cursor = dbapi_conn.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
+    dbapi_conn.create_function("lower", 1, _unicode_lower)
+
+
+def _unicode_lower(value):
+    if value is None:
+        return None
+    return value.lower()
 
 
 def make_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
