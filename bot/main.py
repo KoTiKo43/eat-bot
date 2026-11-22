@@ -1,68 +1,74 @@
 import asyncio
 import logging
+import os
+from collections.abc import Awaitable, Callable
+from typing import Any
 
-import aiohttp
-from aiogram import Bot, Dispatcher
+from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
-from handlers import router
+from aiogram.types import TelegramObject, User
+from dotenv import load_dotenv
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-# 1. Вставь свой токен!
-BOT_TOKEN = "8638987333:AAHcWMETSMyViU4MKdaJ1FdS33VNqdttthM"
+from bot.handlers import router
+from db.engine import make_engine, make_session_factory
+from db.repo import get_or_create_user
 
-# API, которое выдает свежие списки бесплатных SOCKS5 прокси
-PROXY_API_URL = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=5000&country=all"
-
-
-async def fetch_proxies():
-    """Скачивает список свежих прокси из интернета."""
-    logging.info("Скачиваю список свежих прокси...")
-    async with aiohttp.ClientSession() as session:
-        async with session.get(PROXY_API_URL) as response:
-            text = await response.text()
-            # Разбиваем текст по строкам и убираем пустые
-            proxies = [line.strip() for line in text.split("\n") if line.strip()]
-            return proxies
+load_dotenv()
 
 
-async def main():
+class DbSessionMiddleware(BaseMiddleware):
+    """Создаёт AsyncSession на каждый апдейт и разрешает telegram_id -> UserInfo."""
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self.session_factory = session_factory
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        async with self.session_factory() as session:
+            data["session"] = session
+            tg_user: User | None = data.get("event_from_user")
+            if tg_user is not None:
+                data["db_user"] = await get_or_create_user(
+                    session,
+                    telegram_id=tg_user.id,
+                    username=tg_user.username,
+                    first_name=tg_user.first_name,
+                    last_name=tg_user.last_name,
+                )
+            return await handler(event, data)
+
+
+async def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
-    # 1. Получаем список прокси
-    proxies = await fetch_proxies()
-    logging.info(f"Найдено прокси: {len(proxies)} шт. Начинаю автоматический перебор...")
+    bot_token = os.getenv("BOT_TOKEN")
+    if not bot_token:
+        raise RuntimeError("Не задан BOT_TOKEN в .env")
 
-    working_session = None
+    db_url = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./eat.db")
+    proxy_url = os.getenv("PROXY_URL") or None
 
-    # 2. Перебираем каждый прокси
-    for proxy in proxies:
-        proxy_url = f"socks5://{proxy}"
+    engine = make_engine(db_url)
+    session_factory = make_session_factory(engine)
 
-        # Создаем сессию с текущим прокси
-        session = AiohttpSession(proxy=proxy_url)
-        bot = Bot(token=BOT_TOKEN, session=session)
+    session = AiohttpSession(proxy=proxy_url) if proxy_url else None
+    bot = Bot(token=bot_token, session=session)
 
-        try:
-            bot_info = await bot.get_me(request_timeout=5)
-            logging.info(f"✅ УРА! Успешное подключение через {proxy_url}")
-            logging.info(f"Бот {bot_info.first_name} готов к работе!")
-
-            working_session = session
-            break
-
-        except Exception:
-            await session.close()
-            logging.info(f"❌ {proxy_url} не отвечает, пробую следующий...")
-
-    if not working_session:
-        logging.error("Не удалось найти ни одного рабочего прокси из списка.")
-        return
-
-    bot = Bot(token=BOT_TOKEN, session=working_session)
     dp = Dispatcher()
+    dp.update.middleware(DbSessionMiddleware(session_factory))
     dp.include_router(router)
 
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logging.info("Бот Eat! успешно запущен!")
+        await dp.start_polling(bot)
+    finally:
+        await engine.dispose()
 
 
 if __name__ == "__main__":
