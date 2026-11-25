@@ -1,4 +1,4 @@
-"""Контракт репозитория: DTO + сигнатуры + стабы.
+"""Репозиторий: DTO + функции доступа к данным (контракт спринта 1).
 
 Соглашения контракта:
 - Все функции асинхронные, первым параметром принимают готовую AsyncSession
@@ -9,16 +9,17 @@
 - Пустой результат - пустой RecipePage/список, а не исключение.
 - Калории, БЖУ и количества - Decimal; форматирование ("320,50 ккал")
   остаётся на стороне хендлеров.
-- rating_avg/reviews_count по-настоящему заполнятся в спринте 3 (US6);
-  до тех пор это None/0 - рендер должен это переживать.
+- rating_avg/reviews_count агрегируются из отзывов (US6, спринт 3):
+  без отзывов это None/0 - рендер должен это переживать.
 - Сигнатуру поменять можно только обсуждением, а не молчаливой правкой.
 
-Тела - стабы с правдоподобными данными: на них Ильхам пишет и смотрит
-хендлеры до появления реальных запросов (карточки 1.4, 2.2, 3.1, 5.2).
+Спринт 2: справочники, каталог, поиск, карточка, избранное и
+get_or_create_user. Спринт 3: отзывы (US6), предложения (US7) и
+модерация (US8). Стабов больше нет - всё ходит в базу.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import Select, delete, func, insert, select
@@ -28,8 +29,11 @@ from sqlalchemy.orm import selectinload
 from db.models import (
     Category,
     Diet,
+    Ingredient,
     Recipe,
     RecipeIngredient,
+    RecipeStep,
+    Review,
     User,
     favorites,
 )
@@ -47,7 +51,7 @@ class RecipePreview:
     title: str
     cook_time_minutes: int | None
     calories_kcal: Decimal | None
-    rating_avg: float | None  # со спринта 3 (US6)
+    rating_avg: float | None  # агрегат отзывов (US6); None - отзывов нет
     reviews_count: int
 
 
@@ -94,8 +98,8 @@ class RecipeDetails:
     diets: list[str]
     ingredients: list[IngredientAmount]
     steps: list[str]  # инструкции, отсортированы по step_number
-    rating_avg: float | None  # со спринта 3
-    reviews_count: int  # со спринта 3
+    rating_avg: float | None  # агрегат отзывов (US6); None - отзывов нет
+    reviews_count: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -147,16 +151,42 @@ class CategoryDTO:
 # ---------------------------------------------------------------------------
 
 
-def _to_preview(recipe: Recipe) -> RecipePreview:
-    """Recipe -> строка списка. Оценки появятся в спринте 3 (US6)."""
+def _to_preview(recipe: Recipe, rating_avg, reviews_count: int) -> RecipePreview:
+    """(Recipe, avg, count) -> строка списка.
+
+    AVG в SQLite возвращает float, в PostgreSQL - numeric; float() в Python
+    приводит оба диалекта к одному типу DTO.
+    """
     return RecipePreview(
         id=recipe.id,
         title=recipe.title,
         cook_time_minutes=recipe.cook_time_minutes,
         calories_kcal=recipe.calories_kcal,
-        rating_avg=None,
-        reviews_count=0,
+        rating_avg=float(rating_avg) if rating_avg is not None else None,
+        reviews_count=int(reviews_count),
     )
+
+
+def _rating_subqueries():
+    """Скалярные подзапросы: средняя оценка и число отзывов рецепта.
+
+    Коррелируются с Recipe в любом списке (каталог, поиск, избранное,
+    очередь модерации) - JOIN основного запроса им не мешает.
+    """
+    rating_avg = (
+        select(func.avg(Review.rating))
+        .where(Review.recipe_id == Recipe.id)
+        .correlate(Recipe)
+        .scalar_subquery()
+    )
+    reviews_count = (
+        select(func.count())
+        .select_from(Review)
+        .where(Review.recipe_id == Recipe.id)
+        .correlate(Recipe)
+        .scalar_subquery()
+    )
+    return rating_avg, reviews_count
 
 
 async def _recipe_page(
@@ -165,15 +195,23 @@ async def _recipe_page(
     limit: int,
     offset: int,
 ) -> RecipePage:
-    """Превратить select(Recipe) в страницу.
+    """Превратить select(Recipe) в страницу с рейтингами.
 
     Тянем limit + 1 строку: лишняя строка означает has_more=True.
     Порядок в stmt обязан быть детерминированным (order_by id),
     иначе offset выдаёт дубли и пропуски на соседних страницах.
     """
-    rows = (await session.scalars(stmt.limit(limit + 1).offset(offset))).all()
+    rating_avg, reviews_count = _rating_subqueries()
+    stmt = stmt.add_columns(rating_avg, reviews_count)
+    rows = (await session.execute(stmt.limit(limit + 1).offset(offset))).all()
     has_more = len(rows) > limit
-    return RecipePage(items=[_to_preview(r) for r in rows[:limit]], has_more=has_more)
+    items = [_to_preview(recipe, avg, cnt) for recipe, avg, cnt in rows[:limit]]
+    return RecipePage(items=items, has_more=has_more)
+
+
+def _author_name(user: User) -> str:
+    """Имя автора отзыва: first_name -> username -> заглушка id."""
+    return user.first_name or user.username or f"user{user.id}"
 
 
 # ---------------------------------------------------------------------------
@@ -317,8 +355,9 @@ async def get_recipe_details(session: AsyncSession, recipe_id: int) -> RecipeDet
     Статус НЕ фильтруется: approved гарантируют списки (find/search),
     а модерации и подтверждению предложения нужен доступ к pending.
     """
+    rating_avg, reviews_count = _rating_subqueries()
     stmt = (
-        select(Recipe)
+        select(Recipe, rating_avg, reviews_count)
         .where(Recipe.id == recipe_id)
         .options(
             selectinload(Recipe.steps),
@@ -327,9 +366,10 @@ async def get_recipe_details(session: AsyncSession, recipe_id: int) -> RecipeDet
             selectinload(Recipe.ingredient_links).selectinload(RecipeIngredient.ingredient),
         )
     )
-    recipe = (await session.scalars(stmt)).first()
-    if recipe is None:
+    row = (await session.execute(stmt)).first()
+    if row is None:
         return None
+    recipe, avg, cnt = row
     return RecipeDetails(
         id=recipe.id,
         title=recipe.title,
@@ -352,8 +392,8 @@ async def get_recipe_details(session: AsyncSession, recipe_id: int) -> RecipeDet
             for link in sorted(recipe.ingredient_links, key=lambda link: link.ingredient_id)
         ],
         steps=[step.instruction for step in sorted(recipe.steps, key=lambda s: s.step_number)],
-        rating_avg=None,
-        reviews_count=0,
+        rating_avg=float(avg) if avg is not None else None,
+        reviews_count=int(cnt),
     )
 
 
@@ -438,9 +478,25 @@ async def upsert_review(
     """Оставить или обновить отзыв (US6, карточка 6.2).
 
     Повторная оценка = UPDATE, а не вторая строка: UNIQUE (recipe_id, user_id).
-    rating 1..5 - дублирует CHECK уровня БД.
+    Заменяет отзыв ЦЕЛИКОМ: text=None в повторном вызове очищает текст
+    ("оценка без отзыва" - валидный кейс). Бот одной формой присылает и
+    оценку, и текст - частичного обновления нет.
+    rating 1..5 - дублирует CHECK уровня БД, но ValueError до записи
+    дружелюбнее IntegrityError после. Несуществующий recipe_id упадёт
+    на FK-ограничении: хендлер получает id из списков, такого не бывает.
     """
-    # TODO(спринт 3, карточка 6.2)
+    if not 1 <= rating <= 5:
+        raise ValueError(f"rating должен быть целым 1..5, получили {rating}")
+    review = await session.scalar(
+        select(Review).where(Review.recipe_id == recipe_id, Review.user_id == user_id)
+    )
+    if review is None:
+        review = Review(recipe_id=recipe_id, user_id=user_id, rating=rating, text=text)
+        session.add(review)
+    else:
+        review.rating = rating
+        review.text = text
+    await session.commit()
 
 
 async def get_recipe_reviews(
@@ -449,9 +505,30 @@ async def get_recipe_reviews(
     limit: int = 10,
     offset: int = 0,
 ) -> list[ReviewEntry]:
-    """Отзывы рецепта, новые сверху (US6). Рендер - Ильхам (карточка 6.3)."""
-    # TODO(спринт 3, карточка 6.2)
-    return []
+    """Отзывы рецепта, новые сверху (US6). Рендер - Ильхам (карточка 6.3).
+
+    Возвращает список без has_more: бот показывает кнопку "Дальше",
+    если пришло ровно limit штук. created_at в SQLite точен до секунды,
+    поэтому тай-брейк по id отзыва.
+    """
+    stmt = (
+        select(Review, User)
+        .join(Review.user)
+        .where(Review.recipe_id == recipe_id)
+        .order_by(Review.created_at.desc(), Review.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    rows = (await session.execute(stmt)).all()
+    return [
+        ReviewEntry(
+            author_name=_author_name(user),
+            rating=review.rating,
+            text=review.text,
+            created_at=review.created_at,
+        )
+        for review, user in rows
+    ]
 
 
 async def get_user_review(
@@ -460,8 +537,22 @@ async def get_user_review(
     recipe_id: int,
 ) -> ReviewEntry | None:
     """Отзыв текущего пользователя: "ваша оценка" и редактирование (карточка 6.4)."""
-    # TODO(спринт 3, карточка 6.2)
-    return None
+    row = (
+        await session.execute(
+            select(Review, User)
+            .join(Review.user)
+            .where(Review.recipe_id == recipe_id, Review.user_id == user_id)
+        )
+    ).first()
+    if row is None:
+        return None
+    review, user = row
+    return ReviewEntry(
+        author_name=_author_name(user),
+        rating=review.rating,
+        text=review.text,
+        created_at=review.created_at,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -477,11 +568,89 @@ async def create_proposed_recipe(
     """Записать предложенный рецепт (US7, карточка 7.2) и вернуть его id.
 
     Одна транзакция по всем таблицам: recipes (status='pending'), steps,
-    ingredients (get-or-create по названию), M2M-связки.
-    ValueError, если категория/диета не из справочника.
+    ингредиенты (get-or-create по названию), M2M-связки.
+    ValueError, если категория/диета не из справочника или ингредиент
+    указан дважды (иначе повтор упал бы на составном PK).
+
+    Порядок важен: все SELECT - до session.add(recipe). Любой await между
+    add и присваиванием коллекций делает autoflush, объект становится
+    persistent, и замена коллекции тянет ленивую загрузку (запрещена
+    в async). Паттерн перенесён из db/seed.py.
     """
-    # TODO(спринт 3, карточка 7.2)
-    return 0
+    # 1. Валидация справочников: неизвестные имена - все разом, не по одному
+    known_categories: dict[str, Category] = {}
+    if data.categories:
+        rows = await session.scalars(select(Category).where(Category.name.in_(data.categories)))
+        known_categories = {c.name: c for c in rows}
+        unknown = [name for name in data.categories if name not in known_categories]
+        if unknown:
+            raise ValueError(f"неизвестные категории: {', '.join(unknown)}")
+
+    known_diets: dict[str, Diet] = {}
+    if data.diets:
+        rows = await session.scalars(select(Diet).where(Diet.name.in_(data.diets)))
+        known_diets = {d.name: d for d in rows}
+        unknown = [name for name in data.diets if name not in known_diets]
+        if unknown:
+            raise ValueError(f"неизвестные диеты: {', '.join(unknown)}")
+
+    # 2. Дубли ингредиентов в форме: составной PK (recipe_id, ingredient_id)
+    #    повтор упал бы на INSERT - честный ValueError лучше
+    seen_ingredients: set[str] = set()
+    for item in data.ingredients:
+        name = item.name.strip()
+        if name in seen_ingredients:
+            raise ValueError(f"ингредиент «{name}» указан дважды")
+        seen_ingredients.add(name)
+
+    # 3. Существующие ингредиенты - одним запросом (get-or-create ниже)
+    ingredients: dict[str, Ingredient] = {}
+    if seen_ingredients:
+        rows = await session.scalars(
+            select(Ingredient).where(Ingredient.name.in_(seen_ingredients))
+        )
+        ingredients = {i.name: i for i in rows}
+
+    # 4. Рецепт: add -> присваивания БЕЗ await между ними -> один commit
+    recipe = Recipe(
+        title=data.title.strip(),
+        description=data.description,
+        cook_time_minutes=data.cook_time_minutes,
+        servings=data.servings,
+        calories_kcal=data.calories_kcal,
+        proteins_g=data.proteins_g,
+        fats_g=data.fats_g,
+        carbs_g=data.carbs_g,
+        image_file_id=data.image_file_id,
+        status="pending",  # решение за модератором (US8)
+        author_id=author_id,
+    )
+    session.add(recipe)
+
+    # дубли категорий/диет в форме - это чекбоксы, молча схлопываем
+    recipe.categories = [known_categories[name] for name in dict.fromkeys(data.categories)]
+    recipe.diets = [known_diets[name] for name in dict.fromkeys(data.diets)]
+    recipe.steps = [
+        RecipeStep(step_number=number, instruction=step)
+        for number, step in enumerate(data.steps, start=1)
+    ]
+    for item in data.ingredients:
+        name = item.name.strip()
+        ingredient = ingredients.get(name)
+        if ingredient is None:
+            ingredient = Ingredient(name=name)
+            session.add(ingredient)
+            ingredients[name] = ingredient
+        session.add(
+            RecipeIngredient(
+                recipe=recipe,
+                ingredient=ingredient,
+                quantity=item.quantity,
+                unit=item.unit,
+            )
+        )
+    await session.commit()
+    return recipe.id
 
 
 async def list_pending_recipes(
@@ -489,9 +658,13 @@ async def list_pending_recipes(
     limit: int = 5,
     offset: int = 0,
 ) -> RecipePage:
-    """Очередь модерации (US8, карточка 8.2): pending, старые сверху."""
-    # TODO(спринт 3, карточка 8.2)
-    return RecipePage(items=[], has_more=False)
+    """Очередь модерации (US8, карточка 8.2): pending, старые сверху.
+
+    Старые сверху - модератор разбирает залежавшееся раньше нового.
+    created_at в SQLite точен до секунды - тай-брейк по id.
+    """
+    stmt = select(Recipe).where(Recipe.status == "pending").order_by(Recipe.created_at, Recipe.id)
+    return await _recipe_page(session, stmt, limit, offset)
 
 
 async def moderate_recipe(
@@ -504,5 +677,18 @@ async def moderate_recipe(
 
     При approved=True калорийность обязана быть заполнена, иначе ValueError:
     "калорийность nullable, но обязательна до публикации" (§3 ворклога).
+    Статус не меняется - черновик остаётся в очереди, модератор
+    дозаполняет КБЖУ и повторяет решение. Повторная модерация уже
+    разобранного рецепта разрешена (модератор передумал).
     """
-    # TODO(спринт 3, карточка 8.2)
+    recipe = await session.get(Recipe, recipe_id)
+    if recipe is None:
+        raise ValueError(f"рецепт #{recipe_id} не найден")
+    if approved and recipe.calories_kcal is None:
+        raise ValueError("калорийность обязательна до публикации (US8)")
+
+    recipe.status = "approved" if approved else "rejected"
+    recipe.moderated_by = moderator_id
+    # naive UTC в одну шкалу с server_default func.now() в SQLite
+    recipe.moderated_at = datetime.now(UTC).replace(tzinfo=None)
+    await session.commit()
